@@ -1,3 +1,4 @@
+import copy
 import logging
 from pathlib import Path
 from typing import Any
@@ -63,10 +64,17 @@ class PyTorchModelTrainer(PyTorchTrainerInterface):
         self.tb_logger = tb_logger
         self.test_batch_counter = 0
 
+        # Gradient clipping: max L2 norm of gradients, 0 disables clipping
+        self.max_grad_norm: float = kwargs.get("max_grad_norm", 1.0)
+
+        # LR scheduler: cosine annealing from lr down to eta_min over all epochs
+        self.lr_scheduler: torch.optim.lr_scheduler.CosineAnnealingLR | None = None
+
         # Early stopping parameters
         self.early_stopping_patience: int = kwargs.get("early_stopping_patience", 0)
         self.best_val_loss: float = float("inf")
         self.patience_counter: int = 0
+        self.best_model_state: dict | None = None
 
     def fit(self, data_dictionary: dict[str, pd.DataFrame], splits: list[str]):
         """
@@ -84,11 +92,22 @@ class PyTorchModelTrainer(PyTorchTrainerInterface):
         """
         self.model.train()
 
+        # Enable TF32 on Ampere/Hopper/Blackwell GPUs (RTX 3090+) for faster matmul
+        # with negligible precision loss. No-op on CPU or older GPUs.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
         data_loaders_dictionary = self.create_data_loaders_dictionary(data_dictionary, splits)
         n_obs = len(data_dictionary["train_features"])
         n_epochs = self.n_epochs or self.calc_n_epochs(n_obs=n_obs)
+
+        # Cosine annealing decays LR smoothly from optimizer's lr down to eta_min
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=n_epochs, eta_min=1e-6
+        )
+
         batch_counter = 0
-        for _ in range(n_epochs):
+        for epoch in range(n_epochs):
             for _, batch_data in enumerate(data_loaders_dictionary["train"]):
                 xb, yb = batch_data
                 xb = xb.to(self.device)
@@ -98,28 +117,43 @@ class PyTorchModelTrainer(PyTorchTrainerInterface):
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                if self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.tb_logger.log_scalar("train_loss", loss.item(), batch_counter)
                 batch_counter += 1
+
+            self.lr_scheduler.step()
+            self.tb_logger.log_scalar("learning_rate", self.optimizer.param_groups[0]["lr"], epoch)
 
             # evaluation
             if "test" in splits:
                 val_loss = self.estimate_loss(data_loaders_dictionary, "test")
 
-                # Early stopping check
-                if self.early_stopping_patience > 0 and val_loss is not None:
-                    if val_loss < self.best_val_loss:
+                if val_loss is not None:
+                    improved = val_loss < self.best_val_loss
+                    if improved:
                         self.best_val_loss = val_loss
-                        self.patience_counter = 0
-                    else:
-                        self.patience_counter += 1
-                        if self.patience_counter >= self.early_stopping_patience:
-                            logger.info(
-                                f"Early stopping triggered after {self.patience_counter} "
-                                f"epochs without improvement. "
-                                f"Best val_loss: {self.best_val_loss:.6f}"
-                            )
-                            break
+                        self.best_model_state = copy.deepcopy(self.model.state_dict())
+
+                    # Early stopping check
+                    if self.early_stopping_patience > 0:
+                        if improved:
+                            self.patience_counter = 0
+                        else:
+                            self.patience_counter += 1
+                            if self.patience_counter >= self.early_stopping_patience:
+                                logger.info(
+                                    f"Early stopping triggered after {self.patience_counter} "
+                                    f"epochs without improvement. "
+                                    f"Best val_loss: {self.best_val_loss:.6f}"
+                                )
+                                break
+
+        # Restore the best weights seen during training
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+            logger.info(f"Restored best model weights (val_loss: {self.best_val_loss:.6f})")
 
     @torch.no_grad()
     def estimate_loss(

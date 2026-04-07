@@ -17,39 +17,52 @@ from freqtrade.freqai.torch.PyTorchTransformerModel import PyTorchTransformerMod
 
 class PyTorchTransformerRegressor(BasePyTorchRegressor):
     """
-    This class implements the fit method of IFreqaiModel.
-    in the fit method we initialize the model and trainer objects.
-    the only requirement from the model is to be aligned to PyTorchRegressor
-    predict method that expects the model to predict tensor of type float.
-    the trainer defines the training loop.
+    Transformer-based regressor for FreqAI using multi-head self-attention over a
+    sliding window of past candles. Uses PyTorchTransformerModel internally.
 
-    parameters are passed via `model_training_parameters` under the freqai
-    section in the config file. e.g:
-    {
-        ...
+    Parameters are passed via ``model_training_parameters`` in the freqai config block.
+
+    Config example::
+
         "freqai": {
-            ...
-            "conv_width": 30,  // PyTorchTransformer is based on windowing
+            "conv_width": 30,
             "feature_parameters": {
-                ...
-                "include_shifted_candles": 0,  // which removes the need for shifted candles
-                ...
+                "include_shifted_candles": 0
             },
-            "model_training_parameters" : {
+            "model_training_parameters": {
                 "learning_rate": 3e-4,
                 "trainer_kwargs": {
                     "n_steps": 5000,
                     "batch_size": 64,
-                    "n_epochs": null
+                    "n_epochs": null,
+                    "early_stopping_patience": 10,
+                    "max_grad_norm": 1.0,
+                    "huber_delta": 1.0
                 },
                 "model_kwargs": {
-                    "hidden_dim": 512,
-                    "dropout_percent": 0.2,
-                    "n_layer": 1,
-                },
+                    "hidden_dim": 256,
+                    "dropout_percent": 0.1,
+                    "n_layer": 2,
+                    "nhead": 4
+                }
             }
         }
-    }
+
+    model_kwargs:
+        - hidden_dim (int): Internal model dimension. Must be divisible by nhead (auto-adjusted
+          downward with a warning if not). Default: 256
+        - n_layer (int): Number of Transformer encoder layers. Default: 2
+        - dropout_percent (float): Dropout in encoder and output head. Default: 0.1
+        - nhead (int): Number of self-attention heads. Default: 8
+
+    trainer_kwargs:
+        - n_steps (int): Training steps (used to derive n_epochs when n_epochs is null).
+        - n_epochs (int | null): Explicit epoch count. Set null to use n_steps instead.
+        - batch_size (int): Mini-batch size. Default: 64
+        - early_stopping_patience (int): Stop if val_loss does not improve for this many
+          epochs. 0 disables early stopping. Default: 0
+        - max_grad_norm (float): Gradient clipping L2 norm. 0 disables. Default: 1.0
+        - huber_delta (float): Delta parameter for HuberLoss. Default: 1.0
     """
 
     @property
@@ -81,7 +94,10 @@ class PyTorchTransformerRegressor(BasePyTorchRegressor):
         )
         model.to(self.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.learning_rate)
-        criterion = torch.nn.MSELoss()
+        # HuberLoss (SmoothL1) is more robust than MSE for noisy financial data:
+        # it uses MSE for small errors and MAE for large outliers, reducing the
+        # impact of extreme price spikes on training.
+        criterion = torch.nn.HuberLoss(delta=self.trainer_kwargs.get("huber_delta", 1.0))
         # check if continual_learning is activated, and retrieve the model to continue training
         trainer = self.get_init_model(dk.pair)
         if trainer is None:

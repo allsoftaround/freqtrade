@@ -66,7 +66,10 @@ class PyTorchMLPRegressor(BasePyTorchRegressor):
         model = PyTorchMLPModel(input_dim=n_features, output_dim=1, **self.model_kwargs)
         model.to(self.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.learning_rate)
-        criterion = torch.nn.MSELoss()
+        # HuberLoss (SmoothL1) is more robust than MSE for noisy financial data:
+        # it uses MSE for small errors and MAE for large outliers, reducing the
+        # impact of extreme price spikes on training.
+        criterion = torch.nn.HuberLoss(delta=self.trainer_kwargs.get("huber_delta", 1.0))
         # check if continual_learning is activated, and retrieve the model to continue training
         trainer = self.get_init_model(dk.pair)
         if trainer is None:

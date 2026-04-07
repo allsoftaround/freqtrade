@@ -72,14 +72,17 @@ class Block(nn.Module):
         self.ln = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ff(self.ln(x))
-        x = self.dropout(x)
+        x = x + self.dropout(self.ff(self.ln(x)))
         return x
 
 
 class FeedForward(nn.Module):
     """
-    A simple fully-connected feedforward neural network block.
+    A fully-connected feedforward neural network block with 4x hidden expansion.
+
+    Uses the standard Transformer FeedForward pattern: expand to 4*hidden_dim,
+    apply activation, then project back down. This gives the network more
+    representational capacity per block compared to a same-dimension projection.
 
     :param hidden_dim: The number of hidden units in the block.
     :return: torch.Tensor. with shape (batch_size, hidden_dim)
@@ -88,8 +91,9 @@ class FeedForward(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, 4 * hidden_dim),
             nn.ReLU(),
+            nn.Linear(4 * hidden_dim, hidden_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
